@@ -13,8 +13,10 @@ const PORT = Number(process.env.PORT) || 3001;
 // ── CORS ──────────────────────────────────────────────────────────────────────
 const ALLOWED_ORIGINS = [
   "https://www.sanyuanlou.com",
+  "https://www.sanyuanlou.hk",
   "https://www.sanyuanlou.shop",
   "https://sanyuanlou.com",
+  "https://sanyuanlou.hk",
   "https://sanyuanlou.shop",
   "https://sanyuanlou-web.vercel.app",
   "http://localhost:5173",
