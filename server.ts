@@ -10,20 +10,19 @@ dotenv.config();
 const app = express();
 const PORT = Number(process.env.PORT) || 3001;
 
-// ── CORS — allow Vercel frontend + local dev ──────────────────────────────────
+// ── CORS ──────────────────────────────────────────────────────────────────────
 const ALLOWED_ORIGINS = [
   "https://www.sanyuanlou.com",
   "https://www.sanyuanlou.shop",
   "https://sanyuanlou.com",
   "https://sanyuanlou.shop",
-  "https://sanyuanlou-web.vercel.app",   // Vercel preview URL (update if needed)
-  "http://localhost:5173",               // Vite local dev
+  "https://sanyuanlou-web.vercel.app",
+  "http://localhost:5173",
   "http://localhost:3000",
 ];
 
 app.use(cors({
   origin: (origin, callback) => {
-    // Allow requests with no origin (curl, Postman, mobile apps)
     if (!origin) return callback(null, true);
     if (ALLOWED_ORIGINS.includes(origin)) return callback(null, true);
     callback(new Error(`CORS: origin ${origin} not allowed`));
@@ -33,16 +32,24 @@ app.use(cors({
 
 app.use(express.json());
 
-// ── Health check (GCP Cloud Run 需要) ─────────────────────────────────────────
+// ── Health check ──────────────────────────────────────────────────────────────
 app.get("/health", (_, res) => {
   res.json({ status: "ok", service: "sanyuanlou-api", ts: new Date().toISOString() });
 });
 
-// ── Supabase client (service_role key = full access, bypasses RLS) ─────────────
+// ── Supabase (shared halfsphere-db, service_role = full access) ───────────────
 const supabase = createClient(
   process.env.SUPABASE_URL!,
   process.env.SUPABASE_SERVICE_ROLE_KEY!
 );
+
+// ── Halfsphere tier mapping ───────────────────────────────────────────────────
+// 三元楼 tier → Halfsphere user_tiers.tier
+const TIER_MAP: Record<string, string> = {
+  Gold:      "bronze",
+  Platinum:  "silver",
+  BlackCard: "gold",
+};
 
 // ── Sanyuanlou Authoritative Fact Corpus ──────────────────────────────────────
 const SANYUANLOU_CORPUS = [
@@ -83,7 +90,7 @@ const SANYUANLOU_CORPUS = [
   }
 ];
 
-// ── Kimi Client (Moonshot AI, OpenAI-compatible) ──────────────────────────────
+// ── Kimi Client ───────────────────────────────────────────────────────────────
 let kimiClient: OpenAI | null = null;
 function getKimiClient(): { client: OpenAI; isSimulated: boolean } {
   const apiKey = process.env.KIMI_API_KEY;
@@ -96,33 +103,35 @@ function getKimiClient(): { client: OpenAI; isSimulated: boolean } {
   return { client: kimiClient, isSimulated: false };
 }
 
-// ── RAG: Word-level retrieval ─────────────────────────────────────────────────
+// ── RAG retrieval ─────────────────────────────────────────────────────────────
 function retrieveRelevantChunks(query: string): typeof SANYUANLOU_CORPUS {
   const cleanQuery = query.toLowerCase();
   const scored = SANYUANLOU_CORPUS.map(part => {
     let score = 0;
     part.keywords.forEach(kw => { if (cleanQuery.includes(kw.toLowerCase())) score += 3; });
     const titleTokens = part.title.match(/[一-龥]{2,}|[a-z0-9]{3,}/gi) || [];
-    titleTokens.forEach(token => { if (cleanQuery.includes(token.toLowerCase())) score += 1; });
+    titleTokens.forEach(t => { if (cleanQuery.includes(t.toLowerCase())) score += 1; });
     const contentTokens = (part.content.match(/[一-龥]{2,}|[a-z0-9]{3,}/gi) || []).slice(0, 60);
-    contentTokens.forEach(token => { if (cleanQuery.includes(token.toLowerCase())) score += 0.3; });
+    contentTokens.forEach(t => { if (cleanQuery.includes(t.toLowerCase())) score += 0.3; });
     return { part, score };
   });
-  const sorted = scored.filter(item => item.score > 0.5).sort((a, b) => b.score - a.score);
+  const sorted = scored.filter(i => i.score > 0.5).sort((a, b) => b.score - a.score);
   return sorted.length === 0
     ? [SANYUANLOU_CORPUS[0], SANYUANLOU_CORPUS[2]]
-    : sorted.map(item => item.part).slice(0, 3);
+    : sorted.map(i => i.part).slice(0, 3);
 }
 
-// ── REST: Brand corpus ────────────────────────────────────────────────────────
-app.get("/api/corpus", (_, res) => {
-  res.json({ corpus: SANYUANLOU_CORPUS });
-});
+// ── REST: corpus ──────────────────────────────────────────────────────────────
+app.get("/api/corpus", (_, res) => res.json({ corpus: SANYUANLOU_CORPUS }));
 
-// ── CRM: Register new member ──────────────────────────────────────────────────
-// Writes to shared Supabase `members` + `sanyuanlou_members` tables.
-// Because Supabase is the shared DB with Halfsphere, this IS the sync — no
-// separate Halfsphere API call needed.
+// ── CRM: Register ─────────────────────────────────────────────────────────────
+//
+// 写入顺序：
+//   1. auth.users           → Halfsphere 主身份 (admin API，邮件已验证)
+//   2. registration_requests → Halfsphere 注册档案 (status=approved)
+//   3. user_tiers           → 跨品牌统一 tier
+//   4. sanyuanlou_members   → 三元楼 VIP 专属数据
+//
 app.post("/api/crm/register", async (req, res) => {
   const { name, email, phone, tier } = req.body;
 
@@ -134,13 +143,7 @@ app.post("/api/crm/register", async (req, res) => {
   }
 
   try {
-    // 1. Upsert core identity into shared members table (email = primary key)
-    const { error: memberErr } = await supabase
-      .from("members")
-      .upsert({ email, name, phone }, { onConflict: "email" });
-    if (memberErr) throw memberErr;
-
-    // 2. Check for duplicate Sanyuanlou membership
+    // ① 检查三元楼是否已注册
     const { data: existing } = await supabase
       .from("sanyuanlou_members")
       .select("cid")
@@ -150,13 +153,62 @@ app.post("/api/crm/register", async (req, res) => {
       return res.status(409).json({ error: "Email already registered" });
     }
 
-    // 3. Create Sanyuanlou-specific record
+    // ② 在 Halfsphere auth.users 创建账号（已存在则取已有 user_id）
+    let userId: string | null = null;
+    const { data: created, error: createErr } = await supabase.auth.admin.createUser({
+      email,
+      email_confirm: true,          // VIP 直接激活，无需再点邮件验证
+      user_metadata: { display_name: name, phone, source: "sanyuanlou_1846" },
+    });
+
+    if (createErr) {
+      // 如果 email 已在 auth.users 存在 → 查出已有 user_id
+      if (createErr.message?.includes("already been registered")) {
+        const { data: { users } } = await supabase.auth.admin.listUsers();
+        const found = users.find(u => u.email === email);
+        userId = found?.id ?? null;
+      } else {
+        throw createErr;
+      }
+    } else {
+      userId = created.user.id;
+    }
+
+    // ③ upsert registration_requests (Halfsphere 后台可见)
+    await supabase.from("registration_requests").upsert(
+      {
+        email,
+        display_name: name,
+        status: "approved",
+        reason: `sanyuanlou_vip_${tier}`,
+      },
+      { onConflict: "email" }
+    );
+
+    // ④ upsert user_tiers (跨品牌统一 tier)
+    if (userId) {
+      await supabase.from("user_tiers").upsert(
+        {
+          user_id: userId,
+          tier: TIER_MAP[tier] ?? "bronze",
+        },
+        { onConflict: "user_id" }
+      );
+    }
+
+    // ⑤ 创建三元楼 VIP 专属记录
     const cid = `SYL-1846-${Math.floor(1000 + Math.random() * 9000)}-${tier.toUpperCase().substring(0, 3)}`;
-    const brand_tags = [`三元楼_${tier}`, "海棠湾L1-34"];
 
     const { data: sm, error: smErr } = await supabase
       .from("sanyuanlou_members")
-      .insert({ email, cid, tier, brand_tags })
+      .insert({
+        user_id:    userId,
+        email,
+        phone,
+        cid,
+        tier,
+        brand_tags: [`三元楼_${tier}`, "海棠湾L1-34"],
+      })
       .select()
       .single();
     if (smErr) throw smErr;
@@ -166,12 +218,12 @@ app.post("/api/crm/register", async (req, res) => {
       email,
       phone,
       tier,
-      cid: sm.cid,
-      registered_at: sm.registered_at,
-      // Supabase is the shared DB, so it's synced by definition
-      halfsphere_id: sm.id,
-      halfsphere_synced: true,
+      cid:            sm.cid,
+      registered_at:  sm.registered_at,
+      halfsphere_id:  userId,        // Halfsphere auth.users UUID
+      halfsphere_synced: !!userId,   // true = 已写入 Halfsphere 账号体系
     });
+
   } catch (err: any) {
     console.error("[CRM register]", err);
     res.status(500).json({ error: err.message || "Registration failed" });
@@ -186,22 +238,29 @@ app.get("/api/crm/member", async (req, res) => {
   try {
     const { data: sm, error } = await supabase
       .from("sanyuanlou_members")
-      .select("*, members(name, phone)")
+      .select("*")
       .eq("cid", cid)
       .maybeSingle();
 
     if (error) throw error;
     if (!sm) return res.status(404).json({ error: "Member not found" });
 
+    // 从 auth.users 取 display_name / phone（如有更新）
+    let name = sm.email;
+    if (sm.user_id) {
+      const { data: { user } } = await supabase.auth.admin.getUserById(sm.user_id);
+      name = user?.user_metadata?.display_name ?? sm.email;
+    }
+
     res.json({
-      name: sm.members?.name,
-      email: sm.email,
-      phone: sm.members?.phone,
-      tier: sm.tier,
-      cid: sm.cid,
-      registered_at: sm.registered_at,
-      halfsphere_id: sm.id,
-      halfsphere_synced: true,
+      name,
+      email:             sm.email,
+      phone:             sm.phone,
+      tier:              sm.tier,
+      cid:               sm.cid,
+      registered_at:     sm.registered_at,
+      halfsphere_id:     sm.user_id,
+      halfsphere_synced: !!sm.user_id,
     });
   } catch (err: any) {
     console.error("[CRM get]", err);
@@ -226,7 +285,7 @@ app.delete("/api/crm/member", async (req, res) => {
   }
 });
 
-// ── REST: RAG verify using Kimi / Simulated fallback ─────────────────────────
+// ── REST: RAG verify ──────────────────────────────────────────────────────────
 app.post("/api/verify", async (req, res) => {
   try {
     const { query } = req.body;
@@ -289,7 +348,7 @@ ${contextText}
       isSimulated,
       injectedChunks,
       analysis: {
-        score: Math.max(0, Math.min(100, 70 + detectedFacts.length * 6 - detectedHype.length * 25)),
+        score:       Math.max(0, Math.min(100, 70 + detectedFacts.length * 6 - detectedHype.length * 25)),
         noisePercent: detectedHype.length * 20,
         detectedFacts,
         detectedHype,
