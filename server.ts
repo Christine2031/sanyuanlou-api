@@ -145,7 +145,7 @@ app.post("/api/crm/register", async (req, res) => {
   }
 
   try {
-    // ① 检查三元楼是否已注册
+    // ① 检查是否已申请过
     const { data: existing } = await supabase
       .from("sanyuanlou_members")
       .select("cid")
@@ -155,60 +155,29 @@ app.post("/api/crm/register", async (req, res) => {
       return res.status(409).json({ error: "Email already registered" });
     }
 
-    // ② 在 Halfsphere auth.users 创建账号（已存在则取已有 user_id）
-    let userId: string | null = null;
-    const { data: created, error: createErr } = await supabase.auth.admin.createUser({
-      email,
-      email_confirm: true,          // VIP 直接激活，无需再点邮件验证
-      user_metadata: { display_name: name, phone, source: "sanyuanlou_1846" },
-    });
-
-    if (createErr) {
-      // 如果 email 已在 auth.users 存在 → 查出已有 user_id
-      if (createErr.message?.includes("already been registered")) {
-        const { data: { users } } = await supabase.auth.admin.listUsers();
-        const found = users.find(u => u.email === email);
-        userId = found?.id ?? null;
-      } else {
-        throw createErr;
-      }
-    } else {
-      userId = created.user.id;
-    }
-
-    // ③ upsert registration_requests (Halfsphere 后台可见)
+    // ② 写入 registration_requests → Halfsphere 后台人工审批队列
     await supabase.from("registration_requests").upsert(
       {
         email,
         display_name: name,
-        status: "approved",
+        status: "pending",           // 人工审批制：全部从 pending 开始
         reason: `sanyuanlou_vip_${tier}`,
       },
       { onConflict: "email" }
     );
 
-    // ④ upsert user_tiers (跨品牌统一 tier)
-    if (userId) {
-      await supabase.from("user_tiers").upsert(
-        {
-          user_id: userId,
-          tier: TIER_MAP[tier] ?? "bronze",
-        },
-        { onConflict: "user_id" }
-      );
-    }
-
-    // ⑤ 创建三元楼 VIP 专属记录
+    // ③ 创建三元楼 VIP 专属记录（user_id 审批通过后再关联）
     const cid = `SYL-1846-${Math.floor(1000 + Math.random() * 9000)}-${tier.toUpperCase().substring(0, 3)}`;
 
     const { data: sm, error: smErr } = await supabase
       .from("sanyuanlou_members")
       .insert({
-        user_id:    userId,
+        user_id:    null,            // 审批通过后由 Halfsphere 关联 auth.users
         email,
         phone,
         cid,
         tier,
+        status:     "pending",
         brand_tags: [`三元楼_${tier}`, "海棠湾L1-34"],
       })
       .select()
@@ -220,10 +189,11 @@ app.post("/api/crm/register", async (req, res) => {
       email,
       phone,
       tier,
-      cid:            sm.cid,
-      registered_at:  sm.registered_at,
-      halfsphere_id:  userId,        // Halfsphere auth.users UUID
-      halfsphere_synced: !!userId,   // true = 已写入 Halfsphere 账号体系
+      cid:               sm.cid,
+      registered_at:     sm.registered_at,
+      status:            "pending",
+      halfsphere_id:     null,
+      halfsphere_synced: false,
     });
 
   } catch (err: any) {
@@ -261,6 +231,7 @@ app.get("/api/crm/member", async (req, res) => {
       tier:              sm.tier,
       cid:               sm.cid,
       registered_at:     sm.registered_at,
+      status:            sm.status ?? "pending",
       halfsphere_id:     sm.user_id,
       halfsphere_synced: !!sm.user_id,
     });
